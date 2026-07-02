@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Supply Chain Auditor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #0f1f3d; color: #fff; min-height: 100vh; }
+    .header { padding: 2rem; border-bottom: 1px solid #1a3560; }
+    .header h1 { color: #14b8a6; font-size: 1.8rem; }
+    .header p { color: #94a3b8; margin-top: 0.25rem; }
+    .container { max-width: 800px; margin: 3rem auto; padding: 0 1rem; }
+    .card { background: #1a3560; border-radius: 12px; padding: 2rem; margin-bottom: 1.5rem; }
+    .card h2 { color: #14b8a6; margin-bottom: 1rem; font-size: 1.1rem; }
+    .upload-area { border: 2px dashed #14b8a6; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: background 0.2s; }
+    .upload-area:hover { background: rgba(20,184,166,0.1); }
+    input[type="file"] { display: none; }
+    .btn { background: #0d9488; color: white; border: none; padding: 0.75rem 2rem; border-radius: 8px; font-size: 1rem; cursor: pointer; width: 100%; margin-top: 1rem; }
+    .btn:hover { background: #14b8a6; }
+    .btn:disabled { background: #334155; cursor: not-allowed; }
+    .result { display: none; }
+    .risk-badge { display: inline-block; padding: 0.4rem 1rem; border-radius: 20px; font-weight: bold; font-size: 1.1rem; }
+    .risk-SAFE { background: #064e3b; color: #6ee7b7; }
+    .risk-WARNING { background: #78350f; color: #fcd34d; }
+    .risk-DANGER { background: #7f1d1d; color: #fca5a5; }
+    .risk-ERROR { background: #1e1b4b; color: #a5b4fc; }
+    .finding { background: #0f2d4a; padding: 0.6rem 1rem; border-radius: 6px; margin: 0.4rem 0; font-size: 0.9rem; color: #cbd5e1; }
+    .scan-section { margin-top: 1rem; }
+    .scan-section h3 { color: #94a3b8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+    .loader { text-align: center; padding: 2rem; color: #14b8a6; display: none; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🛡️ AI Supply Chain Auditor</h1>
+  <p>Scan AI models for backdoors, unsafe serialization, and vulnerable dependencies</p>
+</div>
+
+<div class="container">
+  <div class="card">
+    <h2>Upload Model to Scan</h2>
+
+    <div class="upload-area" onclick="document.getElementById('modelInput').click()">
+      <p>📁 Click to select model file</p>
+      <p style="color:#64748b; font-size:0.85rem; margin-top:0.5rem">.pkl, .pt, .pth, .safetensors</p>
+      <p id="modelName" style="color:#14b8a6; margin-top:0.5rem"></p>
+    </div>
+    <input type="file" id="modelInput" accept=".pkl,.pt,.pth,.safetensors" onchange="showFileName('modelInput','modelName')">
+
+    <div style="margin-top:1rem">
+      <div class="upload-area" onclick="document.getElementById('reqInput').click()" style="padding:1rem">
+        <p style="font-size:0.9rem">📋 requirements.txt (optional)</p>
+        <p id="reqName" style="color:#14b8a6; font-size:0.85rem; margin-top:0.25rem"></p>
+      </div>
+      <input type="file" id="reqInput" accept=".txt" onchange="showFileName('reqInput','reqName')">
+    </div>
+
+    <button class="btn" onclick="runScan()" id="scanBtn">🔍 Run Security Scan</button>
+  </div>
+
+  <div class="loader" id="loader">
+    <p style="font-size:1.2rem">⚙️ Scanning...</p>
+    <p style="color:#64748b; margin-top:0.5rem">Running serialization, weight, and dependency checks</p>
+  </div>
+
+  <div class="card result" id="resultCard">
+    <h2>Scan Results</h2>
+    <div style="margin-bottom:1rem">
+      <span>Overall Risk: </span>
+      <span class="risk-badge" id="overallRisk"></span>
+    </div>
+
+    <div class="scan-section" id="serializationResult"></div>
+    <div class="scan-section" id="weightResult"></div>
+    <div class="scan-section" id="depResult"></div>
+  </div>
+</div>
+
+<script>
+  function showFileName(inputId, labelId) {
+    const file = document.getElementById(inputId).files[0];
+    if (file) document.getElementById(labelId).textContent = '✓ ' + file.name;
+  }
+
+  function renderSection(containerId, title, report) {
+    if (!report) return;
+    const div = document.getElementById(containerId);
+    const riskColor = { SAFE: '#6ee7b7', WARNING: '#fcd34d', DANGER: '#fca5a5', ERROR: '#a5b4fc' };
+    div.innerHTML = `
+      <h3>${title} — <span style="color:${riskColor[report.risk_level] || '#fff'}">${report.risk_level}</span></h3>
+      ${(report.findings || []).map(f => `<div class="finding">${f}</div>`).join('')}
+      ${report.recommendation ? `<div class="finding" style="color:#14b8a6">💡 ${report.recommendation}</div>` : ''}
+    `;
+  }
+
+  async function runScan() {
+    const modelFile = document.getElementById('modelInput').files[0];
+    if (!modelFile) { alert('Please select a model file first.'); return; }
+
+    const btn = document.getElementById('scanBtn');
+    btn.disabled = true;
+    document.getElementById('loader').style.display = 'block';
+    document.getElementById('resultCard').style.display = 'none';
+
+    const formData = new FormData();
+    formData.append('model_file', modelFile);
+
+    const reqFile = document.getElementById('reqInput').files[0];
+    if (reqFile) formData.append('requirements_file', reqFile);
+
+    try {
+      const res = await fetch('http://127.0.0.1:8000/scan', { method: 'POST', body: formData });
+      const data = await res.json();
+
+      document.getElementById('overallRisk').textContent = data.overall_risk;
+      document.getElementById('overallRisk').className = `risk-badge risk-${data.overall_risk}`;
+
+      renderSection('serializationResult', '🔐 Serialization', data.scan_results?.serialization);
+      renderSection('weightResult', '🧠 Weight Analysis', data.scan_results?.weights);
+      renderSection('depResult', '📦 Dependencies', data.scan_results?.dependencies);
+
+      document.getElementById('resultCard').style.display = 'block';
+    } catch (err) {
+      alert('Scan failed. Is the API server running? (uvicorn api.main:app --reload)');
+    } finally {
+      btn.disabled = false;
+      document.getElementById('loader').style.display = 'none';
+    }
+  }
+</script>
+</body>
+</html>

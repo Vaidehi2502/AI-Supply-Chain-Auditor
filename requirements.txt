@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+requests
+torch
+safetensors
+bandit
+pip-audit
+pydantic
+huggingface-hub
