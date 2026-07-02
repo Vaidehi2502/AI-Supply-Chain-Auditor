@@ -1,31 +1,79 @@
-import pickle
-import struct
+import pickletools
 
-# These pickle opcodes can execute system commands - red flags
-DANGEROUS_OPCODES = {
-    b'R': 'REDUCE - can call arbitrary functions',
-    b'i': 'INST - can instantiate arbitrary classes', 
-    b'\x93': 'STACK_GLOBAL - can import and call anything',
-    b'o': 'OBJ - can create arbitrary objects',
+# Modules/functions that indicate real code-execution intent inside a pickle.
+# If a GLOBAL/STACK_GLOBAL resolves to one of these, it's a genuine threat.
+DANGEROUS_GLOBALS = {
+    ("os", "system"), ("posix", "system"), ("nt", "system"),
+    ("os", "popen"), ("os", "execv"), ("os", "execve"),
+    ("subprocess", "Popen"), ("subprocess", "call"), ("subprocess", "run"),
+    ("subprocess", "check_output"), ("subprocess", "check_call"),
+    ("builtins", "eval"), ("builtins", "exec"), ("builtins", "__import__"),
+    ("builtins", "compile"), ("builtins", "getattr"),
+    ("importlib", "import_module"),
+    ("pty", "spawn"), ("commands", "getoutput"),
+    ("socket", "socket"),
 }
 
-def scan_file(filepath: str) -> dict:
-    """
-    Scan a file for unsafe serialization patterns.
-    Returns a risk report.
-    """
-    result = {
-        "file": filepath,
-        "format": None,
-        "risk_level": "SAFE",
-        "findings": [],
-        "recommendation": ""
-    }
+# Module prefixes considered safe (normal model serialization machinery).
+SAFE_MODULE_PREFIXES = (
+    "numpy", "torch", "collections", "__builtin__.list", "__builtin__.dict",
+    "builtins.list", "builtins.dict", "builtins.set", "builtins.tuple",
+    "builtins.bytearray", "_codecs", "pandas", "scipy", "sklearn",
+)
 
-    # Step 1: Read the file as raw bytes
+PICKLE_MAGIC = (b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
+
+
+def _resolve_globals(content: bytes):
+    """
+    Walk the pickle's opcodes and collect every (module, name) that a GLOBAL or
+    STACK_GLOBAL resolves to. This tells us WHAT the file would import/call,
+    not merely that it contains a call opcode.
+    """
+    found = []
+    try:
+        ops = list(pickletools.genops(content))
+    except Exception:
+        return found, True  # parse failed -> treat as suspicious
+
+    # For STACK_GLOBAL, the module and name are the two preceding string pushes.
+    recent_strings = []
+    for opcode, arg, _pos in ops:
+        name = opcode.name
+        if name in ("SHORT_BINUNICODE", "BINUNICODE", "UNICODE",
+                    "SHORT_BINSTRING", "BINSTRING", "STRING"):
+            recent_strings.append(arg)
+            if len(recent_strings) > 4:
+                recent_strings.pop(0)
+        elif name == "GLOBAL":
+            # arg is "module name" (space-separated)
+            parts = str(arg).split(" ", 1)
+            if len(parts) == 2:
+                found.append((parts[0], parts[1]))
+        elif name == "STACK_GLOBAL":
+            if len(recent_strings) >= 2:
+                found.append((recent_strings[-2], recent_strings[-1]))
+    return found, False
+
+
+def _is_dangerous(module, funcname):
+    if (module, funcname) in DANGEROUS_GLOBALS:
+        return True
+    full = f"{module}.{funcname}"
+    if any(full.startswith(p) for p in SAFE_MODULE_PREFIXES):
+        return False
+    # Unknown module calling into system-ish names -> flag conservatively
+    if funcname in ("system", "popen", "spawn", "eval", "exec"):
+        return True
+    return False
+
+
+def scan_file(filepath: str) -> dict:
+    result = {"file": filepath, "format": None, "risk_level": "SAFE",
+              "findings": [], "recommendation": ""}
     try:
         with open(filepath, "rb") as f:
-            header = f.read(10)  # first 10 bytes tell us the format
+            header = f.read(10)
             f.seek(0)
             content = f.read()
     except Exception as e:
@@ -33,58 +81,52 @@ def scan_file(filepath: str) -> dict:
         result["findings"].append(f"Could not read file: {e}")
         return result
 
-    # Step 2: Detect file format by magic bytes (like a CTF challenge!)
-    # Pickle files start with \x80\x0 to \x80\x05
-    if header[0:2] in [b'\x80\x02', b'\x80\x03', b'\x80\x04', b'\x80\x05']:
-        result["format"] = "pickle"
-        result["risk_level"] = "DANGER"
-        result["findings"].append("File is a pickle - can execute code on load")
-
-        # Step 3: Scan for dangerous opcodes inside
-        for opcode, description in DANGEROUS_OPCODES.items():
-            if opcode in content:
-                result["findings"].append(f"Found opcode: {description}")
-
-        result["recommendation"] = (
-            "REJECT this file. Never load pickle files from untrusted sources. "
-            "Ask the model author to re-export using safetensors format."
-        )
-
-    # Safetensors files start with a JSON length header (8 bytes little-endian)
-    elif filepath.endswith(".safetensors"):
+    if filepath.endswith(".safetensors"):
         result["format"] = "safetensors"
-        result["risk_level"] = "SAFE"
-        result["findings"].append("Safetensors format - sandboxed, cannot execute code")
+        result["findings"].append("Safetensors format - sandboxed, cannot execute code.")
         result["recommendation"] = "Safe to load."
+        return result
 
-    # PyTorch .pt/.pth files use pickle internally
-    elif filepath.endswith((".pt", ".pth", ".bin")):
-        result["format"] = "pytorch"
-        result["risk_level"] = "WARNING"
-        result["findings"].append(
-            "PyTorch files use pickle internally. "
-            "Safe only if from a trusted source AND loaded with weights_only=True"
-        )
-        result["recommendation"] = (
-            "Use torch.load(filepath, weights_only=True) to mitigate risk. "
-            "Prefer safetensors format."
-        )
+    is_pickle = header[0:2] in PICKLE_MAGIC
+    is_torch = filepath.endswith((".pt", ".pth", ".bin"))
 
+    if is_pickle or is_torch:
+        result["format"] = "pytorch" if is_torch else "pickle"
+        globals_found, parse_failed = _resolve_globals(content)
+        dangerous = [(m, n) for (m, n) in globals_found if _is_dangerous(m, n)]
+
+        if parse_failed:
+            result["risk_level"] = "WARNING"
+            result["findings"].append("Could not fully parse pickle opcodes - inspect manually.")
+        if dangerous:
+            result["risk_level"] = "DANGER"
+            for m, n in dangerous:
+                result["findings"].append(
+                    f"Dangerous call: imports {m}.{n} - can execute code on load.")
+            result["recommendation"] = (
+                "REJECT this file. It imports functions capable of executing "
+                "system commands. Never load it. Ask the author to re-export as safetensors.")
+        else:
+            # It's a pickle, but nothing dangerous resolved.
+            result["risk_level"] = "WARNING"
+            safe_list = ", ".join(sorted({m for m, _ in globals_found})) or "none"
+            result["findings"].append(
+                f"Pickle format with no dangerous imports (uses: {safe_list}). "
+                "Still executable in principle - prefer safetensors.")
+            result["recommendation"] = (
+                "No malicious calls detected, but pickle can execute code by design. "
+                "Prefer safetensors for untrusted sources.")
     else:
         result["format"] = "unknown"
         result["risk_level"] = "WARNING"
-        result["findings"].append("Unknown format - could not determine safety")
+        result["findings"].append("Unknown format - could not determine safety.")
         result["recommendation"] = "Manually inspect before loading."
-
     return result
 
 
-# This lets you run the file directly to test it
 if __name__ == "__main__":
-    import sys
+    import sys, json
     if len(sys.argv) < 2:
         print("Usage: python serialization_scanner.py <filepath>")
     else:
-        report = scan_file(sys.argv[1])
-        import json
-        print(json.dumps(report, indent=2))
+        print(json.dumps(scan_file(sys.argv[1]), indent=2))
