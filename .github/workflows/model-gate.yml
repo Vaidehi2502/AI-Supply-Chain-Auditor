@@ -1,0 +1,127 @@
+name: Model Gate
+
+# Scans AI model files added or changed in a pull request.
+# DANGER  -> job fails -> red X -> merge blocked.
+# WARNING/SAFE -> job passes -> green check.
+# Findings are posted back as a PR comment either way.
+
+on:
+  pull_request:
+    paths:
+      - '**.pkl'
+      - '**.pt'
+      - '**.pth'
+      - '**.bin'
+      - '**.safetensors'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install numpy pip-audit
+
+      - name: Find changed model files
+        id: changed
+        run: |
+          BASE="origin/${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1 || true
+          FILES=$(git diff --name-only --diff-filter=AM "$BASE"...HEAD \
+            | grep -E '\.(pkl|pt|pth|bin|safetensors)$' || true)
+          echo "Model files changed in this PR:"
+          echo "$FILES"
+          {
+            echo 'files<<EOF'
+            echo "$FILES"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Scan each changed model
+        id: scan
+        run: |
+          set +e
+          OVERALL_FAIL=0
+          REPORT_FILE=scan_report.md
+          echo "## Model Gate scan results" > "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+
+          FILES="${{ steps.changed.outputs.files }}"
+          if [ -z "$FILES" ]; then
+            echo "No model files to scan." >> "$REPORT_FILE"
+            echo "no_files=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "Scanning: $f"
+            JSON=$(python3 -m scanner.auditor "$f" 2>/dev/null)
+            RISK=$(echo "$JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('overall_risk','ERROR'))" 2>/dev/null || echo ERROR)
+
+            if [ "$RISK" = "DANGER" ] || [ "$RISK" = "ERROR" ]; then
+              ICON="❌"
+              OVERALL_FAIL=1
+            elif [ "$RISK" = "WARNING" ]; then
+              ICON="⚠️"
+            else
+              ICON="✅"
+            fi
+
+            echo "### $ICON \`$f\` — **$RISK**" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+            echo "$JSON" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    ser = d.get('scan_results', {}).get('serialization', {})
+    for finding in ser.get('findings', []):
+        print(f'- {finding}')
+    rec = ser.get('recommendation', '')
+    if rec:
+        print(f'\n> {rec}')
+except Exception as e:
+    print(f'- (could not parse scan output: {e})')
+" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+          done <<< "$FILES"
+
+          cat "$REPORT_FILE"
+          echo "overall_fail=$OVERALL_FAIL" >> "$GITHUB_OUTPUT"
+
+      - name: Post results as PR comment
+        if: always() && steps.scan.outputs.no_files != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('scan_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Fail if any model is dangerous
+        if: steps.scan.outputs.overall_fail == '1'
+        run: |
+          echo "::error::Model Gate blocked this PR — a dangerous model was detected."
+          exit 1
