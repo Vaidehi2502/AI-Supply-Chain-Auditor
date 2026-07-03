@@ -36,83 +36,48 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
           pip install numpy pip-audit
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
 
       - name: Find changed model files
         id: changed
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          BASE="origin/${{ github.event.pull_request.base.ref }}"
-          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1 || true
-          FILES=$(git diff --name-only --diff-filter=AM "$BASE"...HEAD \
-            | grep -E '\.(pkl|pt|pth|bin|safetensors)$' || true)
-          echo "Model files changed in this PR:"
-          echo "$FILES"
+          if [ -n "$BASE_REF" ]; then
+            git fetch origin "$BASE_REF" --depth=1 || true
+            RANGE="origin/$BASE_REF...HEAD"
+          else
+            RANGE="HEAD~1...HEAD"
+          fi
+          FILES=$(git diff --name-only --diff-filter=AM "$RANGE" 2>/dev/null | grep -E '\.(pkl|pt|pth|bin|safetensors)$' || true)
+          if [ -z "$FILES" ]; then
+            FILES=$(git ls-files | grep -E '\.(pkl|pt|pth|bin|safetensors)$' || true)
+          fi
+          echo "Files to scan: $FILES"
           {
             echo 'files<<EOF'
             echo "$FILES"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Scan each changed model
-        id: scan
+      - name: Run Model Gate
+        id: gate
+        env:
+          FILES: ${{ steps.changed.outputs.files }}
         run: |
           set +e
-          OVERALL_FAIL=0
-          REPORT_FILE=scan_report.md
-          echo "## Model Gate scan results" > "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-
-          FILES="${{ steps.changed.outputs.files }}"
-          if [ -z "$FILES" ]; then
-            echo "No model files to scan." >> "$REPORT_FILE"
-            echo "no_files=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            echo "Scanning: $f"
-            JSON=$(python3 -m scanner.auditor "$f" 2>/dev/null)
-            RISK=$(echo "$JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('overall_risk','ERROR'))" 2>/dev/null || echo ERROR)
-
-            if [ "$RISK" = "DANGER" ] || [ "$RISK" = "ERROR" ]; then
-              ICON="❌"
-              OVERALL_FAIL=1
-            elif [ "$RISK" = "WARNING" ]; then
-              ICON="⚠️"
-            else
-              ICON="✅"
-            fi
-
-            echo "### $ICON \`$f\` — **$RISK**" >> "$REPORT_FILE"
-            echo "" >> "$REPORT_FILE"
-            echo "$JSON" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    ser = d.get('scan_results', {}).get('serialization', {})
-    for finding in ser.get('findings', []):
-        print(f'- {finding}')
-    rec = ser.get('recommendation', '')
-    if rec:
-        print(f'\n> {rec}')
-except Exception as e:
-    print(f'- (could not parse scan output: {e})')
-" >> "$REPORT_FILE"
-            echo "" >> "$REPORT_FILE"
-          done <<< "$FILES"
-
-          cat "$REPORT_FILE"
-          echo "overall_fail=$OVERALL_FAIL" >> "$GITHUB_OUTPUT"
+          python scripts/gate_report.py $FILES
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Post results as PR comment
-        if: always() && steps.scan.outputs.no_files != 'true'
+        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('scan_report.md', 'utf8');
+            let body = '## Model Gate scan results\n\n(no report generated)';
+            try { body = fs.readFileSync('scan_report.md', 'utf8'); } catch (e) {}
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -120,8 +85,8 @@ except Exception as e:
               body,
             });
 
-      - name: Fail if any model is dangerous
-        if: steps.scan.outputs.overall_fail == '1'
+      - name: Enforce gate
+        if: steps.gate.outputs.exit_code != '0'
         run: |
           echo "::error::Model Gate blocked this PR — a dangerous model was detected."
           exit 1
